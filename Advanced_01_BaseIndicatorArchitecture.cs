@@ -1,0 +1,167 @@
+using System;
+using System.Collections.Generic;
+using NinjaTrader.Cbi;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Tools;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+    public abstract class BaseOrderFlowIndicator : Indicator {
+        protected const int DEFAULT_LOOKBACK = 50;
+        protected readonly List<double> dataBuffer;
+        protected readonly object lockObj = new object();
+        protected volatile bool isInitialized = false;
+        
+        protected BaseOrderFlowIndicator() {
+            dataBuffer = new List<double>(DEFAULT_LOOKBACK);
+        }
+
+        protected abstract void CalculateMetrics();
+        protected abstract void UpdatePlots();
+
+        protected sealed override void OnStateChange() {
+            if (State == State.SetDefaults) {
+                InitializeDefaults();
+            }
+            else if (State == State.Configure) {
+                InitializeResources();
+            }
+        }
+
+        protected virtual void InitializeDefaults() { }
+        protected virtual void InitializeResources() { }
+
+        protected sealed override void OnBarUpdate() {
+            if (!isInitialized) return;
+            
+            lock (lockObj) {
+                CacheData();
+                CalculateMetrics();
+                UpdatePlots();
+            }
+        }
+
+        protected virtual void CacheData() {
+            if (dataBuffer.Count > DEFAULT_LOOKBACK)
+                dataBuffer.RemoveAt(0);
+            dataBuffer.Add(Close[0]);
+        }
+
+        protected double[] GetCachedData() {
+            return dataBuffer.ToArray();
+        }
+
+        protected void ClearCache() {
+            lock (lockObj) {
+                dataBuffer.Clear();
+            }
+        }
+    }
+
+    public class EnhancedVolumeProfile : BaseOrderFlowIndicator {
+        private Dictionary<double, double> priceProfile;
+        private ObjectPool<VolumeNode> nodePool;
+        private const int POOL_SIZE = 256;
+
+        private struct VolumeNode {
+            public double Price;
+            public double Volume;
+            public void Reset() {
+                Price = 0;
+                Volume = 0;
+            }
+        }
+
+        public EnhancedVolumeProfile() : base() {
+            priceProfile = new Dictionary<double, double>(POOL_SIZE);
+            nodePool = new ObjectPool<VolumeNode>(POOL_SIZE);
+        }
+
+        protected override void InitializeDefaults() {
+            Description = "Enhanced Volume Profile - Smart memory pooling with encapsulated state";
+            Name = "EnhancedVolumeProfile";
+            Calculate = Calculate.OnBarClose;
+            IsOverlay = true;
+            DisplayInDataBox = true;
+            
+            AddPlot(Brushes.DodgerBlue, "POC");
+            AddPlot(Brushes.LimeGreen, "ValueArea");
+            
+            isInitialized = true;
+        }
+
+        protected override void CalculateMetrics() {
+            if (CurrentBar < DEFAULT_LOOKBACK)
+                return;
+
+            priceProfile.Clear();
+            double totalVol = 0;
+            double maxVol = 0;
+            double poc = Close[0];
+
+            for (int i = 0; i < DEFAULT_LOOKBACK; i++) {
+                double key = Math.Round(Closes[i], 2);
+                double vol = Volumes[i];
+                
+                if (!priceProfile.ContainsKey(key))
+                    priceProfile[key] = 0;
+                
+                priceProfile[key] += vol;
+                totalVol += vol;
+
+                if (priceProfile[key] > maxVol) {
+                    maxVol = priceProfile[key];
+                    poc = key;
+                }
+            }
+
+            double cumVol = 0;
+            double target = totalVol * 0.35;
+            double va = Close[0];
+
+            foreach (var kvp in priceProfile) {
+                cumVol += kvp.Value;
+                if (cumVol >= target) {
+                    va = kvp.Key;
+                    break;
+                }
+            }
+
+            Values[0][0] = poc;
+            Values[1][0] = va;
+        }
+
+        protected override void UpdatePlots() { }
+
+        public override string DisplayName => "Enhanced Volume Profile";
+        
+        ~EnhancedVolumeProfile() {
+            nodePool?.Dispose();
+        }
+    }
+
+    public class ObjectPool<T> : IDisposable where T : struct {
+        private readonly Stack<T> available;
+        private readonly int maxSize;
+
+        public ObjectPool(int size) {
+            maxSize = size;
+            available = new Stack<T>(size);
+        }
+
+        public T Rent() {
+            return available.Count > 0 ? available.Pop() : default(T);
+        }
+
+        public void Return(T item) {
+            if (available.Count < maxSize)
+                available.Push(item);
+        }
+
+        public void Dispose() {
+            available?.Clear();
+        }
+    }
+}
